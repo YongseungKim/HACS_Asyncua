@@ -1,16 +1,13 @@
 """Platform for switch integration."""
-
 from __future__ import annotations
 
 import logging
-import asyncio
 from typing import Any
 
 import voluptuous as vol
 
 from homeassistant.components.switch import SwitchDeviceClass, SwitchEntity
-from homeassistant.const import STATE_OFF, STATE_UNAVAILABLE, STATE_OK
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryError
 import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.config_validation import PLATFORM_SCHEMA
@@ -31,6 +28,7 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+# 노드 설정을 위한 스키마 정의
 NODE_SCHEMA = {
     CONF_NODES: [
         {
@@ -48,68 +46,50 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
     extra=vol.ALLOW_EXTRA,
 )
 
-"""
-제공해주신 switch.py 소스 코드는 전체적인 제어 로직은 잘 구성되어 있으나, 
-앞서 발생한 센서 데이터(String) 변환 오류가 스위치 초기화 과정을 중단시키는 구조적 취약점을 가지고 있습니다.
-
-로그에서 보셨듯이 스위치가 로드될 때 await val_switch.async_init() → await self.coordinator.async_refresh()를 호출하는데, 
-이때 센서 쪽에 문자열 에러가 있으면 스위치도 함께 뻗어버립니다. 이를 방지하기 위한 보완 코드를 제안합니다.
-"""
-
 async def async_setup_platform(
     hass: HomeAssistant,
     config: ConfigType,
     async_add_entities: AddEntitiesCallback,
     discovery_info: DiscoveryInfoType | None = None,
 ) -> None:
-    """Set up asyncua_switch coordinator_nodes."""
+    """Set up asyncua_switch 플랫폼 설정."""
 
     coordinator_nodes: dict[str, list[dict[str, str]]] = {}
-    coordinators: dict[str, AsyncuaCoordinator] = {}
     asyncua_switches: list = []
 
-    try:
-        for _idx_node, val_node in enumerate(config[CONF_NODES]):
-            if val_node[CONF_NODE_HUB] not in coordinator_nodes:
-                coordinator_nodes[val_node[CONF_NODE_HUB]] = []
-            coordinator_nodes[val_node[CONF_NODE_HUB]].append(val_node)
+    # 허브별로 노드를 분류합니다.
+    for val_node in config[CONF_NODES]:
+        hub_name = val_node[CONF_NODE_HUB]
+        if hub_name not in coordinator_nodes:
+            coordinator_nodes[hub_name] = []
+        coordinator_nodes[hub_name].append(val_node)
 
-        for key_coordinator, val_coordinator in coordinator_nodes.items():
-            # Get the respective asyncua coordinator
-            if key_coordinator not in hass.data[DOMAIN]:
-                raise ConfigEntryError(
-                    f"Asyncua hub {key_coordinator} not found. Specify a valid asyncua hub in the configuration."
+    for key_coordinator, val_coordinator in coordinator_nodes.items():
+        # 도메인 내 허브 존재 여부 확인
+        if key_coordinator not in hass.data[DOMAIN]:
+            _LOGGER.error("Asyncua hub %s not found in hass.data", key_coordinator)
+            continue
+
+        coordinator = hass.data[DOMAIN][key_coordinator]
+        coordinator.add_sensors(sensors=val_coordinator)
+
+        for val_sensor in val_coordinator:
+            asyncua_switches.append(
+                AsyncuaSwitch(
+                    coordinator=coordinator,
+                    name=val_sensor[CONF_NODE_NAME],
+                    hub=val_sensor[CONF_NODE_HUB],
+                    node_id=val_sensor[CONF_NODE_ID],
+                    addr_di=val_sensor.get(CONF_NODE_SWITCH_DI),
+                    unique_id=val_sensor.get(CONF_NODE_UNIQUE_ID),
                 )
-            coordinators[key_coordinator] = hass.data[DOMAIN][key_coordinator]
-            coordinators[key_coordinator].add_sensors(sensors=val_coordinator)
+            )
 
-            for _idx_sensor, val_sensor in enumerate(val_coordinator):
-                asyncua_switches.append(
-                    AsyncuaSwitch(
-                        coordinator=coordinators[key_coordinator],
-                        name=val_sensor[CONF_NODE_NAME],
-                        hub=val_sensor[CONF_NODE_HUB],
-                        node_id=val_sensor[CONF_NODE_ID],
-                        addr_di=val_sensor.get(CONF_NODE_SWITCH_DI),
-                        unique_id=val_sensor.get(CONF_NODE_UNIQUE_ID),
-                    )
-                )
-
-        async_add_entities(asyncua_switches)
-
-        # 🚨 스위치 개별 초기화 시 오류가 전체를 중단시키지 않도록 방어
-        for idx_switch, val_switch in enumerate(asyncua_switches):
-            try:
-                await val_switch.async_init()
-                _LOGGER.debug("Initialized switch %s - %s", idx_switch, val_switch.attr_name)
-            except Exception as err:
-                _LOGGER.error("Failed to initialize switch %s: %s", val_switch.attr_name, err)
-
-    except Exception as critical_err:
-        _LOGGER.critical("Critical error during asyncua switch setup: %s", critical_err)
+    # 엔티티 일괄 추가 (초기화 블로킹 방지를 위해 async_init은 내부 루프로 처리하지 않음)
+    async_add_entities(asyncua_switches)
 
 
-class AsyncuaSwitch(SwitchEntity, CoordinatorEntity[AsyncuaCoordinator]):
+class AsyncuaSwitch(CoordinatorEntity[AsyncuaCoordinator], SwitchEntity):
     """A switch implementation for Asyncua OPCUA nodes."""
 
     def __init__(
@@ -121,90 +101,72 @@ class AsyncuaSwitch(SwitchEntity, CoordinatorEntity[AsyncuaCoordinator]):
         addr_di: str | None = None,
         unique_id: str | None = None,
     ) -> None:
-        """Initialize the switch."""
+        """스위치 엔티티 초기화."""
         super().__init__(coordinator=coordinator)
         self._attr_name = name
         self._attr_unique_id = (
             unique_id if unique_id is not None else f"{DOMAIN}.{hub}.{node_id}"
         )
-        # 초기 가용성 상태 설정
+        # 🚨 [수정] STATE_UNAVAILABLE 대신 Boolean(False)으로 초기 가용성 설정
         self._attr_available = False
-        self._available = False
         self._attr_device_class = SwitchDeviceClass.SWITCH
-        self._attr_is_on = None
+
         self._hub = hub
-        self._coordinator = coordinator
         self._node_id = node_id
+        # 피드백 주소(DI)가 없으면 쓰기 주소(node_id)를 그대로 사용
         self._addr_di = addr_di if addr_di is not None else node_id
 
     @property
-    def attr_name(self):
-        """Return __attr_name variable."""
-        return self._attr_name
-
-    @property
     def is_on(self) -> bool | None:
-        """Check if OPCUA connection is available and return state."""
-        try:
-            if not self.coordinator.hub.connected:
-                self._attr_is_on = None
-                self._attr_available = False
-                return None
-
-            # 코디네이터 캐시에서 값을 가져옴 (안전한 접근)
-            raw_val = self.coordinator.hub.cache_val.get(self._attr_unique_id, None)
-
-            if raw_val is None:
-                self._attr_is_on = None
-            else:
-                # Int(0, 1)와 Bool(True, False) 모두를 안전하게 처리
-                self._attr_is_on = bool(raw_val)
-
-            self._attr_available = True
-            return self._attr_is_on
-        except Exception as err:
-            _LOGGER.error("Error reading state for %s: %s", self._attr_name, err)
+        """코디네이터의 데이터를 기반으로 스위치 On/Off 상태 반환."""
+        if self.coordinator.data is None:
             return None
 
-    async def async_init(self) -> None:
-        """Initialize switch to get latest value."""
-        try:
-            await self._async_set_value()
-        except Exception as err:
-            _LOGGER.warning("Initial value fetch failed for %s (Server might be starting): %s", self._attr_name, err)
+        # 🚨 [중요] 코디네이터에서 '이름' 기반으로 데이터를 추출
+        raw_val = self.coordinator.data.get(self._attr_name)
 
-    async def _async_set_value(self, val: bool = None, **kwargs) -> None:
-        """Set value and handle potential errors during refresh."""
-        try:
-            if val is not None:
-                # 서버 전송 (실패 시 예외 발생)
-                await self.coordinator.hub.set_value(
-                    nodeid=self._node_id,
-                    value=val,
-                    **kwargs,
-                )
-
-            # 피드백 값을 읽어옴 (제어 주소와 상태 주소가 다를 수 있음)
-            new_val = await self.coordinator.hub.get_value(nodeid=self._addr_di)
-
-            if new_val is not None:
-                self._attr_is_on = bool(new_val)
-                self._attr_available = True
-
-            # 리프레시 중 다른 센서 에러가 스위치 제어를 방해하지 않도록 독립 처리
-            try:
-                await self.coordinator.async_refresh()
-            except Exception as e:
-                _LOGGER.warning("Refresh post-toggle failed for %s, but command was sent: %s", self._attr_name, e)
-
-        except Exception as err:
-            _LOGGER.error("Error setting switch value for %s: %s", self._attr_name, err)
+        if raw_val is None:
             self._attr_available = False
+            return None
+
+        self._attr_available = True
+        # 숫자(0, 1)나 불리언 모두 대응
+        return bool(raw_val)
 
     async def async_turn_on(self, **kwargs: Any) -> None:
-        """Turn the entity on."""
-        await self._async_set_value(val=True)
+        """스위치를 켭니다 (서버로 1 전송)."""
+        await self._async_set_value(True)
 
     async def async_turn_off(self, **kwargs: Any) -> None:
-        """Turn the entity off."""
-        await self._async_set_value(val=False)
+        """스위치를 끕니다 (서버로 0 전송)."""
+        await self._async_set_value(False)
+
+    async def _async_set_value(self, val: bool) -> None:
+        """서버에 값을 기록하고 상태를 즉시 업데이트합니다."""
+        try:
+            # 🚨 [핵심] 아르헨티나 서버 규격(Int64)에 맞춰 0/1로 변환 전송
+            target_val = 1 if val else 0
+
+            # 허브를 통해 서버에 값 기록
+            await self.coordinator.hub.set_value(
+                nodeid=self._node_id,
+                value=target_val
+            )
+
+            # 🚨 [개선] 낙관적 업데이트: 서버 응답 전 UI 상태를 먼저 변경하여 반응성 향상
+            self._attr_is_on = val
+            self.async_write_ha_state()
+
+            # 제어 후 다른 센서들의 상태도 갱신하도록 요청
+            await self.coordinator.async_request_refresh()
+
+        except Exception as err:
+            _LOGGER.error("Error setting switch %s value: %s", self._attr_name, err)
+            self._attr_available = False
+            self.async_write_ha_state()
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """코디네이터 데이터가 변경되면 호출됩니다."""
+        # is_on 프로퍼티가 가용성 및 상태를 판단하므로 상태 기록만 수행
+        self.async_write_ha_state()
