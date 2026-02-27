@@ -48,7 +48,11 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
     extra=vol.ALLOW_EXTRA,
 )
 
+"""
+데이터 타입 불일치 문제나 서버 측에서 **Int(0, 1)**로 데이터를 보내는 상황을 고려할 때, 데이터 해석의 유연성을 높이는 수정이 필요합니다.
 
+아르헨티나 현장의 BESS 시스템에서 통신 두절이나 예기치 않은 데이터 값이 들어와도 센서가 unknown으로 뻗지 않도록 보완된 코드를 제안
+"""
 async def async_setup_platform(
     hass: HomeAssistant,
     config: ConfigType,
@@ -122,10 +126,24 @@ class AsyncuaBinarySensor(CoordinatorEntity[AsyncuaCoordinator], BinarySensorEnt
     @property
     def is_on(self) -> bool | None:
         """Return true if the binary sensor is on."""
-        self._attr_is_on = self._parse_coordinator_data(
+        raw_value = self._parse_coordinator_data(
             coordinator_data=self.coordinator.data
         )
-        return self._attr_is_on
+
+        # 🚨 [개선 1] 데이터 유효성 검사 및 가용성 상태 업데이트
+        if raw_value is None:
+            self._attr_available = False
+            return None
+
+        self._attr_available = True
+
+        # 🚨 [개선 2] 다양한 데이터 타입(Int, String, Bool)을 안전하게 Boolean으로 변환
+        if isinstance(raw_value, str):
+            # 문자열 "0", "false", "off" (대소문자 무시)는 False로 처리
+            return raw_value.lower() not in ("0", "false", "off", "no")
+
+        # 숫자 0은 False, 그 외(1 등)는 True로 처리
+        return bool(raw_value)
 
     @property
     def unique_id(self) -> str | None:
@@ -138,12 +156,14 @@ class AsyncuaBinarySensor(CoordinatorEntity[AsyncuaCoordinator], BinarySensorEnt
         return self._node_id
 
     def _parse_coordinator_data(
-        self,
-        coordinator_data: dict[str, Any],
+            self,
+            coordinator_data: dict[str, Any],
     ) -> Any:
         """Parse the value from the mapped coordinator."""
-        if self._attr_name is None:
-            raise ConfigEntryError(
-                f"Unable to find {self._attr_name} in coordinator {self.coordinator.name}"
-            )
-        return coordinator_data.get(self._attr_name)
+        # 🚨 [개선 3] 에러 방지: 데이터가 아예 없는 경우 안전하게 None 반환
+        if coordinator_data is None:
+            return None
+
+        # name 기반으로 데이터를 찾되, 없으면 None 반환
+        value = coordinator_data.get(self._attr_name)
+        return value

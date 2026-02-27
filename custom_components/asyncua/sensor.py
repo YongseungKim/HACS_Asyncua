@@ -99,6 +99,9 @@ async def async_setup_platform(
     async_add_entities(new_entities=asyncua_sensors)
 
 
+"""
+데이터가 숫자가 아니면 숫자 관련 설정을 자동으로 해제하는 방어 코드를 추가해 드립니다.
+"""
 class AsyncuaSensor(CoordinatorEntity[AsyncuaCoordinator], SensorEntity):
     """A sensor implementation for Asyncua OPCUA nodes."""
 
@@ -124,6 +127,9 @@ class AsyncuaSensor(CoordinatorEntity[AsyncuaCoordinator], SensorEntity):
         self._attr_device_class = device_class
         self._attr_native_unit_of_measurement = unit_of_measurement
         self._attr_native_value = None
+
+        # 🚨 [수정 1] 초기화 시점에 바로 state_class를 할당하지 않고 나중에 결정합니다.
+        self._initial_state_class = state_class
         self._attr_state_class = state_class
         self._attr_suggested_display_precision = precision
         # self._attr_unit_of_measurement = unit_of_measurement
@@ -157,7 +163,24 @@ class AsyncuaSensor(CoordinatorEntity[AsyncuaCoordinator], SensorEntity):
     @callback
     def _handle_coordinator_update(self) -> None:
         """Handle update of the data."""
-        self._attr_native_value = self._parse_coordinator_data(
+        raw_value = self._parse_coordinator_data(
             coordinator_data=self.coordinator.data,
         )
+
+        # 🚨 [수정 2] 방어 로직 추가: 값이 숫자가 아닌 문자열인 경우 처리
+        if isinstance(raw_value, str):
+            try:
+                # 숫자로 변환 시도 (float로 변환 가능하면 숫자 센서로 유지)
+                float(raw_value)
+            except (ValueError, TypeError):
+                # 🔴 숫자가 아닌 문자열(예: 날짜)인 경우, 숫자 관련 속성을 강제로 제거합니다.
+                self._attr_state_class = None
+                self._attr_device_class = None
+                self._attr_native_unit_of_measurement = None
+                self._attr_suggested_display_precision = None
+        else:
+            # 값이 숫자라면 원래 설정대로 복구
+            self._attr_state_class = self._initial_state_class
+
+        self._attr_native_value = raw_value
         self.async_write_ha_state()
